@@ -8,6 +8,11 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.animation import FuncAnimation
 import ast
+import logging
+import traceback
+
+logging.basicConfig(filename='nn_visualizer.log', level=logging.DEBUG,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
 class NeuronLayer:
     def __init__(self, input_size, output_size, activation="sigmoid"):
@@ -207,27 +212,88 @@ class NeuralNetworkVisualizer:
     def load_csv_dataset(self):
         file_path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
         if not file_path:
+            self.status_var.set("No file selected")
             return
         try:
+            logging.info(f"Loading CSV: {file_path}")
             df = pd.read_csv(file_path)
-            if df.empty or len(df.columns) < 2:
-                raise ValueError("CSV must have at least 2 columns (features + output)")
-            X = df.iloc[:, :-1].values
-            y = df.iloc[:, -1].values.reshape(-1, 1)
+            if df.empty:
+                raise ValueError("CSV file is empty")
+            if df.isnull().any().any():
+                raise ValueError("CSV contains missing values. Please preprocess the data.")
+            if not df.select_dtypes(include=np.number).columns.equals(df.columns):
+                raise ValueError("All columns must contain numeric data")
+            columns = list(df.columns)
+            if len(columns) < 2:
+                raise ValueError("CSV must have at least 2 columns")
+            column_dialog = tk.Toplevel(self.root)
+            column_dialog.title("Select Columns")
+            column_dialog.geometry("400x300")
+            column_dialog.transient(self.root)
+            column_dialog.grab_set()
+            Label(column_dialog, text="Select Feature Columns:", font=("Arial", 10, "bold")).pack(pady=5)
+            feature_vars = {}
+            for col in columns:
+                var = tk.BooleanVar(value=True)
+                feature_vars[col] = var
+                tk.Checkbutton(column_dialog, text=col, variable=var).pack(anchor="w")
+            Label(column_dialog, text="Select Target Columns:", font=("Arial", 10, "bold")).pack(pady=5)
+            target_vars = {}
+            for col in columns:
+                var = tk.BooleanVar(value=False)
+                target_vars[col] = var
+                tk.Checkbutton(column_dialog, text=col, variable=var).pack(anchor="w")
+            selected_columns = []
+            def confirm_selection():
+                feature_cols = [col for col, var in feature_vars.items() if var.get()]
+                target_cols = [col for col, var in target_vars.items() if var.get()]
+                if not feature_cols:
+                    messagebox.showerror("Error", "At least one feature column must be selected")
+                    return
+                if not target_cols:
+                    messagebox.showerror("Error", "At least one target column must be selected")
+                    return
+                selected_columns.extend([feature_cols, target_cols])
+                column_dialog.destroy()
+            Button(column_dialog, text="Confirm", command=confirm_selection, bg="#4caf50", fg="white").pack(pady=10)
+            self.root.wait_window(column_dialog)
+            if not selected_columns:
+                raise ValueError("No columns selected")
+            feature_cols, target_cols = selected_columns
+            X = df[feature_cols].values
+            y = df[target_cols].values
             if X.ndim != 2 or y.ndim != 2 or X.shape[0] != y.shape[0]:
-                raise ValueError("Invalid CSV format: X and y must be 2D with same number of samples")
+                raise ValueError(f"Invalid data format: X shape {X.shape}, y shape {y.shape} must be 2D with same number of samples")
+            if self.loss_var.get() == "BCE":
+                if y.shape[1] != 1:
+                    raise ValueError(f"BCE requires a single output column, got {y.shape[1]}")
+                if not np.all((y >= -0.1) & (y <= 1.1)):
+                    raise ValueError("BCE requires outputs to be approximately between 0 and 1")
+            elif self.loss_var.get() == "CCE":
+                if not np.all(np.isin(y, [0, 1])):
+                    raise ValueError("CCE requires binary (0 or 1) values in one-hot encoded outputs")
+                if np.any(np.sum(y, axis=1) != 1):
+                    raise ValueError("CCE requires one-hot encoded outputs where each row sums to 1")
+                if y.shape[1] < 2:
+                    raise ValueError("CCE requires at least 2 output classes")
             self.X = X
             self.y = y
             self.input_size = self.X.shape[1]
             self.output_size = self.y.shape[1]
-            if self.loss_var.get() == "BCE":
-                if not np.all(np.isin(self.y, [0, 1])) or self.output_size != 1:
-                    raise ValueError("BCE requires binary outputs (0 or 1) and a single output neuron")
+            def array_to_string(arr):
+                return str(arr.tolist()).replace(' ', '')
+            self.input_text.delete("1.0", tk.END)
+            self.output_text.delete("1.0", tk.END)
+            self.input_text.insert("1.0", array_to_string(X))
+            self.output_text.insert("1.0", array_to_string(y))
             self.update_layer_sizes()
             self.initialize_network()
             self.dataset_var.set("Custom")
             self.status_var.set(f"Loaded CSV dataset: {file_path}")
+            logging.info(f"Successfully loaded CSV: X shape {X.shape}, y shape {y.shape}")
         except Exception as e:
+            error_msg = f"Failed to load CSV: {str(e)}\n{traceback.format_exc()}"
+            logging.error(error_msg)
             messagebox.showerror("Error", f"Failed to load CSV: {str(e)}")
             self.dataset_var.set("XOR")
             self.change_dataset()
@@ -235,13 +301,19 @@ class NeuralNetworkVisualizer:
     def change_dataset(self, *args):
         dataset = self.dataset_var.get()
         try:
+            logging.info(f"Changing dataset to: {dataset}")
             if dataset == "Custom":
                 input_str = self.input_text.get("1.0", tk.END).strip()
                 output_str = self.output_text.get("1.0", tk.END).strip()
-                self.X = np.array(ast.literal_eval(input_str))
-                self.y = np.array(ast.literal_eval(output_str))
+                if not input_str or not output_str:
+                    raise ValueError("Custom dataset requires non-empty input and output fields")
+                try:
+                    self.X = np.array(ast.literal_eval(input_str))
+                    self.y = np.array(ast.literal_eval(output_str))
+                except (SyntaxError, ValueError) as parse_error:
+                    raise ValueError(f"Invalid custom dataset format. Expected Python literals, got: input={input_str}, output={output_str}. Error: {str(parse_error)}")
                 if self.X.ndim != 2 or self.y.ndim != 2 or self.X.shape[0] != self.y.shape[0]:
-                    raise ValueError("Invalid input/output dimensions: X and y must be 2D with same number of samples")
+                    raise ValueError(f"Invalid input/output dimensions: X shape {self.X.shape}, y shape {self.y.shape} must be 2D with same number of samples")
             else:
                 if dataset == "XOR":
                     self.X = np.array([[0, 0], [0, 1], [1, 0], [1, 1]])
@@ -287,22 +359,30 @@ class NeuralNetworkVisualizer:
             self.input_size = self.X.shape[1]
             self.output_size = self.y.shape[1]
             if self.loss_var.get() == "BCE":
-                if not np.all(np.isin(self.y, [0, 1])) or self.output_size != 1:
-                    raise ValueError("BCE requires binary outputs (0 or 1) and a single output neuron")
+                if not self.output_size == 1:
+                    raise ValueError(f"BCE requires a single output neuron, got {self.output_size}")
+                if not np.all((self.y >= -0.1) & (self.y <= 1.1)):
+                    raise ValueError("BCE requires outputs to be approximately between 0 and 1")
             elif self.loss_var.get() == "CCE":
                 if not np.all(np.isin(self.y, [0, 1])):
                     raise ValueError("CCE requires binary (0 or 1) values in one-hot encoded outputs")
                 if np.any(np.sum(self.y, axis=1) != 1):
                     raise ValueError("CCE requires one-hot encoded outputs where each row sums to 1")
                 if self.y.shape[1] < 2:
-                    raise ValueError("CCE requires at least 2 output classes for softmax")
+                    raise ValueError("CCE requires at least 2 output classes")
             self.update_layer_sizes()
             self.initialize_network()
             self.status_var.set(f"Loaded {dataset} dataset")
+            logging.info(f"Successfully loaded dataset {dataset}: X shape {self.X.shape}, y shape {self.y.shape}")
         except Exception as e:
+            error_msg = f"Invalid dataset format: {str(e)}\n{traceback.format_exc()}"
+            logging.error(error_msg)
             messagebox.showerror("Error", f"Invalid dataset format: {str(e)}")
-            self.dataset_var.set("XOR")
-            self.change_dataset()
+            if dataset != "XOR":
+                self.dataset_var.set("XOR")
+                self.change_dataset()
+            else:
+                self.status_var.set("Failed to load XOR dataset")
 
     def update_layer_sizes(self):
         try:
